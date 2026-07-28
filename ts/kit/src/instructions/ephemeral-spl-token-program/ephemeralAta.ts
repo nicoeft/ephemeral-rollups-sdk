@@ -35,9 +35,9 @@ import {
 } from "../../pda";
 import {
   depositAndQueueTransferIx,
+  deriveQueueVaultAta,
   deriveTransferQueue,
   initTransferQueueIx,
-  processPendingTransferQueueRefillIx,
 } from "./transferQueue";
 import { encryptEd25519Recipient } from "./crypto";
 import {
@@ -1379,7 +1379,6 @@ async function buildDelegateSplInstructions(
     instructions.push(
       initVaultIx(vault, mint, payer, vaultEphemeralAta, vaultAta),
       initVaultAtaIx(payer, vaultAta, vault, mint),
-      await delegateIx(payer, vaultEphemeralAta, validator),
     );
   }
 
@@ -1442,7 +1441,6 @@ async function buildIdempotentDelegateSplInstructions(
     instructions.push(
       initVaultIx(vault, mint, payer, vaultEphemeralAta, vaultAta),
       initVaultAtaIx(payer, vaultAta, vault, mint),
-      await delegateIx(payer, vaultEphemeralAta, validator),
     );
   }
 
@@ -1564,7 +1562,6 @@ export async function delegateSplWithPrivateTransfer(
     instructions.push(
       initVaultIx(vault, mint, payer, vaultEphemeralAta, vaultAta),
       initVaultAtaIx(payer, vaultAta, vault, mint),
-      await delegateIx(payer, vaultEphemeralAta, validator),
     );
   }
 
@@ -1636,11 +1633,15 @@ export async function transferSpl(
           }
 
           const [queue] = await deriveTransferQueue(mint, validator);
-          const [vault] = await deriveVault(mint);
-          const vaultAta = await deriveVaultAta(mint, vault);
+          const vault = queue;
+          const vaultAta = await deriveQueueVaultAta(mint, validator);
+          const setupInstructions = initVaultIfMissing
+            ? [await initTransferQueueIx(payer, queue, mint, validator)]
+            : [];
 
           return [
-            depositAndQueueTransferIx(
+            ...setupInstructions,
+            await depositAndQueueTransferIx(
               queue,
               vault,
               mint,
@@ -1683,26 +1684,33 @@ export async function transferSpl(
     instructions.push(
       initVaultIx(vault, mint, payer, vaultEphemeralAta, vaultAta),
       initVaultAtaIx(payer, vaultAta, vault, mint),
-      await delegateIx(payer, vaultEphemeralAta, validator),
     );
+  }
+
+  if (
+    initVaultIfMissing &&
+    opts.visibility === "private" &&
+    opts.fromBalance === "base" &&
+    opts.toBalance === "base"
+  ) {
+    if (validator == null) {
+      throw new Error(
+        "validator is required for private base-to-base transfers",
+      );
+    }
+
+    const [queue] = await deriveTransferQueue(mint, validator);
+    instructions.push(await initTransferQueueIx(payer, queue, mint, validator));
   }
 
   if (opts.fromBalance === "base" && initAtasIfMissing) {
     instructions.push(initVaultAtaIx(payer, fromAta, from, mint));
   }
 
-  const maybeRefillInstructions = async (): Promise<Instruction[]> => {
-    if (opts.fromBalance !== "base" || validator == null) {
-      return [];
-    }
-
-    const [queue] = await deriveTransferQueue(mint, validator);
-    return [await processPendingTransferQueueRefillIx(queue)];
-  };
-
   switch (opts.visibility) {
     case "private":
       if (opts.fromBalance === "base" && opts.toBalance === "base") {
+        const [fromEphemeralAta] = await deriveEphemeralAta(from, mint);
         const [shuttleEphemeralAta] = await deriveShuttleEphemeralAta(
           from,
           mint,
@@ -1716,7 +1724,8 @@ export async function transferSpl(
 
         return [
           ...instructions,
-          ...(await maybeRefillInstructions()),
+          initEphemeralAtaIx(fromEphemeralAta, from, mint, payer),
+          await delegateIx(payer, fromEphemeralAta, validator),
           await depositAndDelegateShuttleEphemeralAtaWithMergeAndPrivateTransferIx(
             payer,
             shuttleEphemeralAta,
@@ -1744,6 +1753,7 @@ export async function transferSpl(
           instructions.push(
             initVaultAtaIx(payer, toAta, to, mint),
             initEphemeralAtaIx(toEphemeralAta, to, mint, payer),
+            await createEataPermissionIx(toEphemeralAta, payer),
             await delegateIx(payer, toEphemeralAta, validator),
           );
         }

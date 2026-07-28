@@ -25,12 +25,16 @@ import {
   deriveEphemeralAta,
   deriveHydraCrankPda,
   deriveLamportsPda,
+  deriveGroupReceipt,
+  deriveQueueEphemeralAta,
+  deriveQueueVaultAta,
   deriveStashPda,
   deriveTransferQueue,
   deriveRentPda,
   deriveShuttleAta,
   deriveShuttleEphemeralAta,
   deriveVault,
+  deriveVaultAta,
   ensureTransferQueueCrankIx,
   initEphemeralAtaIx,
   initTransferQueueIx,
@@ -46,11 +50,14 @@ import {
 } from "../instructions/ephemeral-spl-token-program";
 import {
   DELEGATION_PROGRAM_ID,
+  EPHEMERAL_VAULT_ID,
   EPHEMERAL_SPL_TOKEN_PROGRAM_ID,
   HYDRA_PROGRAM_ID,
   MAGIC_PROGRAM_ID,
   MAGIC_CONTEXT_ID,
   PERMISSION_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
 } from "../constants";
 import {
   delegateBufferPdaFromDelegatedAccountAndOwnerProgram,
@@ -812,7 +819,7 @@ describe("Exposed Instructions (web3.js)", () => {
     const mint = new PublicKey("11111111111111111111111111111114");
     const validator = new PublicKey("11111111111111111111111111111115");
 
-    it("should delegate the vault eata when initializing the vault in legacy flow", async () => {
+    it("should not delegate the vault eata when initializing the vault in legacy flow", async () => {
       const [vault] = deriveVault(mint);
       const [vaultEphemeralAta] = deriveEphemeralAta(vault, mint);
 
@@ -823,18 +830,15 @@ describe("Exposed Instructions (web3.js)", () => {
         idempotent: false,
       });
 
-      expect(instructions[3].keys[1].pubkey.toBase58()).toBe(
-        vaultEphemeralAta.toBase58(),
-      );
-      expect(instructions[3].data[0]).toBe(4);
       expect(
-        Buffer.from(instructions[3].data.subarray(1)).equals(
-          validator.toBuffer(),
+        instructions.find(
+          (ix) =>
+            ix.data[0] === 4 && ix.keys[1]?.pubkey.equals(vaultEphemeralAta),
         ),
-      ).toBe(true);
+      ).toBeUndefined();
     });
 
-    it("should delegate the vault eata when initializing the vault in idempotent flow", async () => {
+    it("should not delegate the vault eata when initializing the vault in idempotent flow", async () => {
       const [vault] = deriveVault(mint);
       const [vaultEphemeralAta] = deriveEphemeralAta(vault, mint);
 
@@ -844,15 +848,12 @@ describe("Exposed Instructions (web3.js)", () => {
         shuttleId: 7,
       });
 
-      expect(instructions[2].keys[1].pubkey.toBase58()).toBe(
-        vaultEphemeralAta.toBase58(),
-      );
-      expect(instructions[2].data[0]).toBe(4);
       expect(
-        Buffer.from(instructions[2].data.subarray(1)).equals(
-          validator.toBuffer(),
+        instructions.find(
+          (ix) =>
+            ix.data[0] === 4 && ix.keys[1]?.pubkey.equals(vaultEphemeralAta),
         ),
-      ).toBe(true);
+      ).toBeUndefined();
     });
 
     it("should use setup_and_delegate_shuttle_with_merge in idempotent flow when amount is nonzero", async () => {
@@ -879,6 +880,41 @@ describe("Exposed Instructions (web3.js)", () => {
           validator.toBuffer(),
         ),
       ).toBe(true);
+    });
+
+    it("should use the token program override in idempotent flow", async () => {
+      const [vault] = deriveVault(mint);
+      const vaultAta = deriveVaultAta(mint, vault, TOKEN_2022_PROGRAM_ID);
+
+      const instructions = await delegateSpl(owner, mint, 1n, {
+        validator,
+        initVaultIfMissing: true,
+        initAtasIfMissing: true,
+        shuttleId: 7,
+        tokenProgram: TOKEN_2022_PROGRAM_ID,
+      });
+      const setupAndDelegateInstruction = instructions.find(
+        (ix) => ix.data[0] === 24,
+      );
+
+      expect(instructions[0].keys[4].pubkey.toBase58()).toBe(
+        vaultAta.toBase58(),
+      );
+      expect(instructions[0].keys[5].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+      expect(instructions[1].keys[1].pubkey.toBase58()).toBe(
+        vaultAta.toBase58(),
+      );
+      expect(instructions[1].keys[5].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+      expect(setupAndDelegateInstruction?.keys[15].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+      expect(setupAndDelegateInstruction?.keys[18].pubkey.toBase58()).toBe(
+        vaultAta.toBase58(),
+      );
     });
 
     it("should keep the shuttle eata writable in the zero-amount shuttle setup flow", async () => {
@@ -927,6 +963,7 @@ describe("Exposed Instructions (web3.js)", () => {
           minDelayMs: 100n,
           maxDelayMs: 300n,
           split: 4,
+          exactOut: false,
         },
       );
 
@@ -943,21 +980,46 @@ describe("Exposed Instructions (web3.js)", () => {
       const data = Buffer.from(privateTransferInstruction.data);
       expect(data.readUInt32LE(1)).toBe(7);
       expect(data.readBigUInt64LE(5)).toBe(1n);
+      expect(data[13]).toBe(0);
 
-      const [validatorField, nextOffset] = readLengthPrefixedField(data, 13);
-      const [destinationField, suffixOffset] = readLengthPrefixedField(
-        data,
-        nextOffset,
-      );
+      const destinationField = data.subarray(14, 14 + 80);
+      const validatorField = data.subarray(14 + 80 + 1, 14 + 80 + 1 + 32);
+
       const [suffixField, endOffset] = readLengthPrefixedField(
         data,
-        suffixOffset,
+        14 + 80 + 1 + 32,
       );
 
       expect(validatorField.equals(validator.toBuffer())).toBe(true);
       expect(destinationField).toHaveLength(80);
       expect(suffixField).toHaveLength(68);
       expect(endOffset).toBe(data.length);
+    });
+
+    it("should not delegate the vault eata when initializing the vault", async () => {
+      const [vault] = deriveVault(mint);
+      const [vaultEphemeralAta] = deriveEphemeralAta(vault, mint);
+
+      const instructions = await delegateSplWithPrivateTransfer(
+        owner,
+        mint,
+        1n,
+        {
+          validator,
+          shuttleId: 7,
+          initVaultIfMissing: true,
+          minDelayMs: 100n,
+          maxDelayMs: 300n,
+          split: 4,
+        },
+      );
+
+      expect(
+        instructions.find(
+          (ix) =>
+            ix.data[0] === 4 && ix.keys[1]?.pubkey.equals(vaultEphemeralAta),
+        ),
+      ).toBeUndefined();
     });
   });
 
@@ -977,6 +1039,25 @@ describe("Exposed Instructions (web3.js)", () => {
       expect(withdrawInstruction).toBeDefined();
       expect(withdrawInstruction?.keys).toHaveLength(16);
       expect(instructions.find((ix) => ix.data[0] === 3)).toBeUndefined();
+    });
+
+    it("should use the token program override when idempotent", async () => {
+      const instructions = await withdrawSpl(owner, mint, 1n, {
+        validator,
+        initAtasIfMissing: true,
+        shuttleId: 7,
+        tokenProgram: TOKEN_2022_PROGRAM_ID,
+      });
+
+      const ataInstruction = instructions.find((ix) =>
+        ix.keys[5]?.pubkey.equals(TOKEN_2022_PROGRAM_ID),
+      );
+      const withdrawInstruction = instructions.find((ix) => ix.data[0] === 26);
+
+      expect(ataInstruction).toBeDefined();
+      expect(withdrawInstruction?.keys[15].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
     });
 
     it("should fall back to the legacy withdraw instruction when idempotent is false", async () => {
@@ -1047,8 +1128,51 @@ describe("Exposed Instructions (web3.js)", () => {
     const mint = Keypair.generate().publicKey;
     const validator = Keypair.generate().publicKey;
 
+    it("should build base-to-base stealth transfers to off-curve pool PDAs", async () => {
+      const [stealthPool] = PublicKey.findProgramAddressSync(
+        [Buffer.from("stealth_pool"), mint.toBuffer()],
+        EPHEMERAL_SPL_TOKEN_PROGRAM_ID,
+      );
+      const [fromEphemeralAta] = deriveEphemeralAta(from, mint);
+
+      expect(PublicKey.isOnCurve(stealthPool.toBuffer())).toBe(false);
+
+      const instructions = await transferSpl(from, stealthPool, mint, 25n, {
+        visibility: "private",
+        fromBalance: "base",
+        toBalance: "base",
+        validator,
+        shuttleId: 7,
+        privateTransfer: {
+          minDelayMs: 100n,
+          maxDelayMs: 300n,
+          split: 4,
+        },
+      });
+
+      expect(instructions).toHaveLength(3);
+      expect(instructions[0].data[0]).toBe(0);
+      expect(instructions[0].keys[0].pubkey.toBase58()).toBe(
+        fromEphemeralAta.toBase58(),
+      );
+      expect(instructions[1].data[0]).toBe(4);
+      expect(instructions[2].data[0]).toBe(25);
+      expect(instructions[2].keys).toHaveLength(19);
+
+      const data = Buffer.from(instructions[2].data);
+      expect(data.readUInt32LE(1)).toBe(7);
+      expect(data.readBigUInt64LE(5)).toBe(25n);
+
+      const [suffixField, endOffset] = readLengthPrefixedField(
+        data,
+        14 + 80 + 1 + 32,
+      );
+      expect(suffixField).toHaveLength(68);
+      expect(endOffset).toBe(data.length);
+    });
+
     it("should use the shuttle private transfer instruction for private base-to-base transfers", async () => {
-      const [queue] = deriveTransferQueue(mint, validator);
+      const [fromEphemeralAta] = deriveEphemeralAta(from, mint);
       const instructions = await transferSpl(from, to, mint, 25n, {
         visibility: "private",
         fromBalance: "base",
@@ -1062,23 +1186,26 @@ describe("Exposed Instructions (web3.js)", () => {
         },
       });
 
-      expect(instructions).toHaveLength(2);
-      expect(instructions[0].data[0]).toBe(28);
-      expect(instructions[0].keys[1].pubkey.toBase58()).toBe(queue.toBase58());
-      const data = Buffer.from(instructions[1].data);
+      expect(instructions).toHaveLength(3);
+      expect(instructions[0].data[0]).toBe(0);
+      expect(instructions[0].keys[0].pubkey.toBase58()).toBe(
+        fromEphemeralAta.toBase58(),
+      );
+      expect(instructions[1].data[0]).toBe(4);
+      expect(instructions[1].keys[1].pubkey.toBase58()).toBe(
+        fromEphemeralAta.toBase58(),
+      );
+      const data = Buffer.from(instructions[2].data);
       expect(data[0]).toBe(25);
-      expect(instructions[1].keys).toHaveLength(19);
+      expect(instructions[2].keys).toHaveLength(19);
       expect(data.readUInt32LE(1)).toBe(7);
       expect(data.readBigUInt64LE(5)).toBe(25n);
 
-      const [validatorField, nextOffset] = readLengthPrefixedField(data, 13);
-      const [destinationField, suffixOffset] = readLengthPrefixedField(
-        data,
-        nextOffset,
-      );
+      const destinationField = data.subarray(14, 14 + 80);
+      const validatorField = data.subarray(14 + 80 + 1, 14 + 80 + 1 + 32);
       const [suffixField, endOffset] = readLengthPrefixedField(
         data,
-        suffixOffset,
+        14 + 80 + 1 + 32,
       );
 
       expect(validatorField.equals(validator.toBuffer())).toBe(true);
@@ -1102,17 +1229,16 @@ describe("Exposed Instructions (web3.js)", () => {
         },
       });
 
-      const data = Buffer.from(instructions[1].data);
-      const [, nextOffset] = readLengthPrefixedField(data, 13);
-      const [, suffixOffset] = readLengthPrefixedField(data, nextOffset);
-      const [suffixField] = readLengthPrefixedField(data, suffixOffset);
+      const data = Buffer.from(instructions[2].data);
+      const [suffixField] = readLengthPrefixedField(data, 14 + 80 + 1 + 32);
 
       expect(suffixField).toHaveLength(76);
     });
 
     it("should initialize the destination ATA and vault when requested", async () => {
-      const [vault] = deriveVault(mint);
-      const [vaultEphemeralAta] = deriveEphemeralAta(vault, mint);
+      const [queue] = deriveTransferQueue(mint, validator);
+      const [queueEphemeralAta] = deriveQueueEphemeralAta(mint, validator);
+      const [fromEphemeralAta] = deriveEphemeralAta(from, mint);
 
       const instructions = await transferSpl(from, to, mint, 25n, {
         visibility: "private",
@@ -1129,13 +1255,74 @@ describe("Exposed Instructions (web3.js)", () => {
         },
       });
 
-      expect(instructions).toHaveLength(5);
-      expect(instructions[2].keys[1].pubkey.toBase58()).toBe(
-        vaultEphemeralAta.toBase58(),
+      expect(instructions).toHaveLength(6);
+      expect(instructions[0].data[0]).toBe(1);
+      expect(instructions[1].data[0]).toBe(1);
+      expect(instructions[2].data[0]).toBe(12);
+      expect(instructions[2].keys[1].pubkey.toBase58()).toBe(queue.toBase58());
+      expect(instructions[2].keys[7].pubkey.toBase58()).toBe(
+        queueEphemeralAta.toBase58(),
       );
-      expect(instructions[2].data[0]).toBe(4);
-      expect(instructions[3].data[0]).toBe(28);
-      expect(instructions[4].data[0]).toBe(25);
+      expect(instructions[3].data[0]).toBe(0);
+      expect(instructions[3].keys[0].pubkey.toBase58()).toBe(
+        fromEphemeralAta.toBase58(),
+      );
+      expect(instructions[4].data[0]).toBe(4);
+      expect(instructions[4].keys[1].pubkey.toBase58()).toBe(
+        fromEphemeralAta.toBase58(),
+      );
+      expect(instructions[5].data[0]).toBe(25);
+    });
+
+    it("should use the token program override when initializing the vault", async () => {
+      const [vault] = deriveVault(mint);
+      const vaultAta = deriveVaultAta(mint, vault, TOKEN_2022_PROGRAM_ID);
+      const queueVaultAta = deriveQueueVaultAta(
+        mint,
+        validator,
+        TOKEN_2022_PROGRAM_ID,
+      );
+
+      const instructions = await transferSpl(from, to, mint, 25n, {
+        visibility: "private",
+        fromBalance: "base",
+        toBalance: "base",
+        validator,
+        shuttleId: 7,
+        initVaultIfMissing: true,
+        tokenProgram: TOKEN_2022_PROGRAM_ID,
+        privateTransfer: {
+          minDelayMs: 100n,
+          maxDelayMs: 300n,
+          split: 4,
+        },
+      });
+
+      expect(instructions).toHaveLength(6);
+      expect(instructions[0].keys[4].pubkey.toBase58()).toBe(
+        vaultAta.toBase58(),
+      );
+      expect(instructions[0].keys[5].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+      expect(instructions[1].keys[1].pubkey.toBase58()).toBe(
+        vaultAta.toBase58(),
+      );
+      expect(instructions[1].keys[5].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+      expect(instructions[2].keys[8].pubkey.toBase58()).toBe(
+        queueVaultAta.toBase58(),
+      );
+      expect(instructions[2].keys[9].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+      expect(instructions[5].keys[14].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+      expect(instructions[5].keys[17].pubkey.toBase58()).toBe(
+        vaultAta.toBase58(),
+      );
     });
 
     it("should prepend source ATA creation when initAtasIfMissing is set on base-source transfers", async () => {
@@ -1167,7 +1354,30 @@ describe("Exposed Instructions (web3.js)", () => {
       expect(Buffer.from(instructions[0].data).readBigUInt64LE(5)).toBe(25n);
     });
 
-    it("should initialize and delegate the receiver eata for private base-to-ephemeral transfers when requested", async () => {
+    it("should not delegate the vault eata for private base-to-ephemeral vault setup", async () => {
+      const [vault] = deriveVault(mint);
+      const [vaultEphemeralAta] = deriveEphemeralAta(vault, mint);
+
+      const instructions = await transferSpl(from, to, mint, 25n, {
+        visibility: "private",
+        fromBalance: "base",
+        toBalance: "ephemeral",
+        validator,
+        shuttleId: 7,
+        initVaultIfMissing: true,
+      });
+
+      expect(instructions).toHaveLength(3);
+      expect(
+        instructions.find(
+          (ix) =>
+            ix.data[0] === 4 && ix.keys[1]?.pubkey.equals(vaultEphemeralAta),
+        ),
+      ).toBeUndefined();
+      expect(instructions[2].data[0]).toBe(24);
+    });
+
+    it("should initialize permission and delegate the receiver eata for private base-to-ephemeral transfers when requested", async () => {
       const [toEphemeralAta] = deriveEphemeralAta(to, mint);
 
       const instructions = await transferSpl(from, to, mint, 25n, {
@@ -1179,18 +1389,22 @@ describe("Exposed Instructions (web3.js)", () => {
         initIfMissing: true,
       });
 
-      expect(instructions).toHaveLength(4);
+      expect(instructions).toHaveLength(5);
       expect(instructions[0].data[0]).toBe(1);
       expect(instructions[0].keys[2].pubkey.toBase58()).toBe(to.toBase58());
       expect(instructions[1].data[0]).toBe(0);
       expect(instructions[1].keys[0].pubkey.toBase58()).toBe(
         toEphemeralAta.toBase58(),
       );
-      expect(instructions[2].data[0]).toBe(4);
-      expect(instructions[2].keys[1].pubkey.toBase58()).toBe(
+      expect(instructions[2].data[0]).toBe(6);
+      expect(instructions[2].keys[0].pubkey.toBase58()).toBe(
         toEphemeralAta.toBase58(),
       );
-      expect(instructions[3].data[0]).toBe(24);
+      expect(instructions[3].data[0]).toBe(4);
+      expect(instructions[3].keys[1].pubkey.toBase58()).toBe(
+        toEphemeralAta.toBase58(),
+      );
+      expect(instructions[4].data[0]).toBe(24);
     });
 
     it("should ignore initAtasIfMissing on ephemeral-source transfers", async () => {
@@ -1226,17 +1440,25 @@ describe("Exposed Instructions (web3.js)", () => {
         },
       });
 
-      expect(instructions).toHaveLength(1);
-      expect(instructions[0].data[0]).toBe(16);
-      expect(instructions[0].keys).toHaveLength(9);
-      expect(instructions[0].keys[5].pubkey.toBase58()).toBe(to.toBase58());
-      expect(instructions[0].keys[8].pubkey.toBase58()).toBe(
-        instructions[0].keys[3].pubkey.toBase58(),
+      expect(instructions).toHaveLength(2);
+      expect(instructions[0].data[0]).toBe(12);
+      expect(instructions[1].data[0]).toBe(16);
+      expect(instructions[1].keys).toHaveLength(12);
+      expect(instructions[1].keys[5].pubkey.toBase58()).toBe(to.toBase58());
+      expect(instructions[1].keys[8].pubkey.toBase58()).toBe(
+        instructions[1].keys[3].pubkey.toBase58(),
       );
-      expect(Buffer.from(instructions[0].data).readBigUInt64LE(1)).toBe(25n);
-      expect(Buffer.from(instructions[0].data).readBigUInt64LE(9)).toBe(100n);
-      expect(Buffer.from(instructions[0].data).readBigUInt64LE(17)).toBe(300n);
-      expect(Buffer.from(instructions[0].data).readUInt32LE(25)).toBe(4);
+      expect(instructions[1].keys[10].pubkey.toBase58()).toBe(
+        EPHEMERAL_VAULT_ID.toBase58(),
+      );
+      expect(instructions[1].keys[11].pubkey.toBase58()).toBe(
+        MAGIC_PROGRAM_ID.toBase58(),
+      );
+      expect(Buffer.from(instructions[1].data).readBigUInt64LE(1)).toBe(25n);
+      expect(Buffer.from(instructions[1].data).readUIntLE(9, 3)).not.toBe(0);
+      expect(Buffer.from(instructions[1].data).readBigUInt64LE(12)).toBe(100n);
+      expect(Buffer.from(instructions[1].data).readBigUInt64LE(20)).toBe(300n);
+      expect(Buffer.from(instructions[1].data).readUInt32LE(28)).toBe(4);
     });
 
     it("should require validator for private ephemeral-to-base transfers", async () => {
@@ -1367,28 +1589,47 @@ describe("Exposed Instructions (web3.js)", () => {
         100n,
         300n,
         4,
+        source,
+        undefined,
+        TOKEN_PROGRAM_ID,
+      );
+      const groupId = Buffer.from(instruction.data).readUIntLE(9, 3);
+      const [groupReceipt] = deriveGroupReceipt(queue, mockPublicKey, groupId);
+      const groupIdSeed = Buffer.alloc(4);
+      groupIdSeed.writeUInt32LE(groupId, 0);
+      const [expectedGroupReceipt] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("group-receipt"),
+          queue.toBuffer(),
+          mockPublicKey.toBuffer(),
+          groupIdSeed,
+        ],
+        EPHEMERAL_SPL_TOKEN_PROGRAM_ID,
       );
 
       expect(instruction).toBeInstanceOf(TransactionInstruction);
-      expect(instruction.keys).toHaveLength(9);
+      expect(instruction.keys).toHaveLength(12);
+      expect(groupId).not.toBe(0);
+      expect(groupReceipt.toBase58()).toBe(expectedGroupReceipt.toBase58());
       expect(instruction.keys[8].pubkey.toBase58()).toBe(source.toBase58());
       expect(instruction.keys[8].isWritable).toBe(true);
-      expect(Array.from(instruction.data)).toEqual([
-        16,
-        ...Array.from(
-          Buffer.from(
-            [25n, 100n, 300n].flatMap((value) => {
-              const out = Buffer.alloc(8);
-              out.writeBigUInt64LE(value);
-              return Array.from(out);
-            }),
-          ),
-        ),
-        4,
-        0,
-        0,
-        0,
-      ]);
+      expect(instruction.keys[9].pubkey.toBase58()).toBe(
+        groupReceipt.toBase58(),
+      );
+      expect(instruction.keys[9].isWritable).toBe(true);
+      expect(instruction.keys[10].pubkey.toBase58()).toBe(
+        EPHEMERAL_VAULT_ID.toBase58(),
+      );
+      expect(instruction.keys[10].isWritable).toBe(true);
+      expect(instruction.keys[11].pubkey.toBase58()).toBe(
+        MAGIC_PROGRAM_ID.toBase58(),
+      );
+      expect(instruction.keys[11].isWritable).toBe(false);
+      expect(instruction.data[0]).toBe(16);
+      expect(Buffer.from(instruction.data).readBigUInt64LE(1)).toBe(25n);
+      expect(Buffer.from(instruction.data).readBigUInt64LE(12)).toBe(100n);
+      expect(Buffer.from(instruction.data).readBigUInt64LE(20)).toBe(300n);
+      expect(Buffer.from(instruction.data).readUInt32LE(28)).toBe(4);
     });
 
     it("should allow overriding the reimbursement token account", () => {
@@ -1408,6 +1649,8 @@ describe("Exposed Instructions (web3.js)", () => {
         300n,
         4,
         reimbursementTokenInfo,
+        undefined,
+        TOKEN_PROGRAM_ID,
       );
 
       expect(instruction.keys[8].pubkey.toBase58()).toBe(
@@ -1430,31 +1673,17 @@ describe("Exposed Instructions (web3.js)", () => {
         4,
         source,
         42n,
+        TOKEN_PROGRAM_ID,
       );
 
-      expect(Array.from(instruction.data)).toEqual([
-        16,
-        ...Array.from(
-          Buffer.from(
-            [25n, 100n, 300n].flatMap((value) => {
-              const out = Buffer.alloc(8);
-              out.writeBigUInt64LE(value);
-              return Array.from(out);
-            }),
-          ),
-        ),
-        4,
-        0,
-        0,
-        0,
-        ...Array.from(
-          (() => {
-            const out = Buffer.alloc(8);
-            out.writeBigUInt64LE(42n);
-            return out;
-          })(),
-        ),
-      ]);
+      expect(instruction.data).toHaveLength(40);
+      expect(instruction.data[0]).toBe(16);
+      expect(Buffer.from(instruction.data).readBigUInt64LE(1)).toBe(25n);
+      expect(Buffer.from(instruction.data).readUIntLE(9, 3)).not.toBe(0);
+      expect(Buffer.from(instruction.data).readBigUInt64LE(12)).toBe(100n);
+      expect(Buffer.from(instruction.data).readBigUInt64LE(20)).toBe(300n);
+      expect(Buffer.from(instruction.data).readUInt32LE(28)).toBe(4);
+      expect(Buffer.from(instruction.data).readBigUInt64LE(32)).toBe(42n);
     });
   });
 
@@ -1520,6 +1749,8 @@ describe("Exposed Instructions (web3.js)", () => {
 
     it("should include validator and requested item count in initTransferQueueIx", () => {
       const [queue] = deriveTransferQueue(mint, validator);
+      const [queueEphemeralAta] = deriveQueueEphemeralAta(mint, validator);
+      const queueVaultAta = deriveQueueVaultAta(mint, validator);
       const instruction = initTransferQueueIx(
         mockPublicKey,
         queue,
@@ -1529,13 +1760,37 @@ describe("Exposed Instructions (web3.js)", () => {
       );
 
       expect(instruction).toBeInstanceOf(TransactionInstruction);
-      expect(instruction.keys).toHaveLength(7);
+      expect(instruction.keys).toHaveLength(16);
       expect(instruction.keys[2].pubkey.toBase58()).toBe(
         permissionPdaFromAccount(queue).toBase58(),
       );
       expect(instruction.keys[4].pubkey.toBase58()).toBe(validator.toBase58());
       expect(instruction.keys[6].pubkey.toBase58()).toBe(
         PERMISSION_PROGRAM_ID.toBase58(),
+      );
+      expect(instruction.keys[7].pubkey.toBase58()).toBe(
+        queueEphemeralAta.toBase58(),
+      );
+      expect(instruction.keys[8].pubkey.toBase58()).toBe(
+        queueVaultAta.toBase58(),
+      );
+      expect(instruction.keys[9].pubkey.toBase58()).toBe(
+        TOKEN_PROGRAM_ID.toBase58(),
+      );
+      expect(instruction.keys[12].pubkey.toBase58()).toBe(
+        delegateBufferPdaFromDelegatedAccountAndOwnerProgram(
+          queueEphemeralAta,
+          EPHEMERAL_SPL_TOKEN_PROGRAM_ID,
+        ).toBase58(),
+      );
+      expect(instruction.keys[13].pubkey.toBase58()).toBe(
+        delegationRecordPdaFromDelegatedAccount(queueEphemeralAta).toBase58(),
+      );
+      expect(instruction.keys[14].pubkey.toBase58()).toBe(
+        delegationMetadataPdaFromDelegatedAccount(queueEphemeralAta).toBase58(),
+      );
+      expect(instruction.keys[15].pubkey.toBase58()).toBe(
+        DELEGATION_PROGRAM_ID.toBase58(),
       );
       expect(Array.from(instruction.data)).toEqual([12, 92, 0, 0, 0]);
     });
@@ -1634,6 +1889,25 @@ describe("Exposed Instructions (web3.js)", () => {
         deriveEphemeralAta(vault, mint)[0].toBase58(),
       );
     });
+
+    it("should accept a token program override", () => {
+      const vault = new PublicKey("11111111111111111111111111111113");
+      const mint = new PublicKey("11111111111111111111111111111114");
+      const payer = new PublicKey("11111111111111111111111111111115");
+      const instruction = initVaultIx(
+        vault,
+        mint,
+        payer,
+        TOKEN_2022_PROGRAM_ID,
+      );
+
+      expect(instruction.keys[4].pubkey.toBase58()).toBe(
+        deriveVaultAta(mint, vault, TOKEN_2022_PROGRAM_ID).toBase58(),
+      );
+      expect(instruction.keys[5].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
+    });
   });
 
   describe("withdrawSplIx (Ephemeral SPL Token Program)", () => {
@@ -1645,6 +1919,20 @@ describe("Exposed Instructions (web3.js)", () => {
       expect(instruction.data).toHaveLength(9);
       expect(instruction.data[0]).toBe(3);
       expect(Buffer.from(instruction.data).readBigUInt64LE(1)).toBe(1n);
+    });
+
+    it("should accept a token program override", () => {
+      const owner = new PublicKey("11111111111111111111111111111113");
+      const mint = new PublicKey("11111111111111111111111111111114");
+      const [vault] = deriveVault(mint);
+      const instruction = withdrawSplIx(owner, mint, 1n, TOKEN_2022_PROGRAM_ID);
+
+      expect(instruction.keys[4].pubkey.toBase58()).toBe(
+        deriveVaultAta(mint, vault, TOKEN_2022_PROGRAM_ID).toBase58(),
+      );
+      expect(instruction.keys[6].pubkey.toBase58()).toBe(
+        TOKEN_2022_PROGRAM_ID.toBase58(),
+      );
     });
   });
 
@@ -1702,22 +1990,16 @@ describe("Exposed Instructions (web3.js)", () => {
       );
 
       const data = Buffer.from(instruction.data);
-      expect(data[0]).toBe(30); // discriminator
+      expect(data[0]).toBe(29); // discriminator
       expect(data.readUInt32LE(1)).toBe(7); // shuttle_id
       // Layout after the discriminator:
       //   [1..5) shuttle_id  [5] stash_bump  [6..38) mint
       //   [38..48) 10 bumps  → 3 vardata blobs start at 48.
       expect(data.subarray(6, 38).equals(mint.toBuffer())).toBe(true);
 
-      const [validatorField, nextOffset] = readLengthPrefixedField(data, 48);
-      const [destinationField, suffixOffset] = readLengthPrefixedField(
-        data,
-        nextOffset,
-      );
-      const [suffixField, endOffset] = readLengthPrefixedField(
-        data,
-        suffixOffset,
-      );
+      const validatorField = data.subarray(48, 80);
+      const destinationField = data.subarray(80, 160);
+      const [suffixField, endOffset] = readLengthPrefixedField(data, 160);
 
       expect(validatorField.equals(validator.toBuffer())).toBe(true);
       // ChaCha20-Poly1305 encryption: 32 (ephemeral pubkey) + plaintext +
@@ -1744,12 +2026,7 @@ describe("Exposed Instructions (web3.js)", () => {
       );
 
       const data = Buffer.from(instruction.data);
-      const [, afterValidator] = readLengthPrefixedField(data, 48);
-      const [, afterDestination] = readLengthPrefixedField(
-        data,
-        afterValidator,
-      );
-      const [suffixField] = readLengthPrefixedField(data, afterDestination);
+      const [suffixField] = readLengthPrefixedField(data, 160);
       // Suffix plaintext is now 28 bytes (+u64 clientRefId): 32 + 28 + 16 = 76.
       expect(suffixField).toHaveLength(76);
     });
@@ -1791,12 +2068,7 @@ describe("Exposed Instructions (web3.js)", () => {
       );
 
       const data = Buffer.from(instruction.data);
-      const [, afterValidator] = readLengthPrefixedField(data, 48);
-      const [, afterDestination] = readLengthPrefixedField(
-        data,
-        afterValidator,
-      );
-      const [suffixField] = readLengthPrefixedField(data, afterDestination);
+      const [suffixField] = readLengthPrefixedField(data, 160);
       expect(suffixField).toHaveLength(76);
     });
 
